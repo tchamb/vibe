@@ -10,8 +10,6 @@ import jukebox
 import torch as t
 import librosa
 import os
-from functools import reduce
-from time import time
 from jukebox.make_models import make_vqvae, make_prior, MODELS, make_model
 from jukebox.hparams import Hyperparams, setup_hparams
 from jukebox.sample import sample_single_window, _sample, \
@@ -64,9 +62,9 @@ assert hps.sample_length >= top_prior.n_ctx*top_prior.raw_to_tokens, f'Please ch
 # Load the metadata prompt from the rest of the notebook
 # This should be a dictionary with the following (key, val) pairs:
 # {
-#     "artist": PREDICTED ARTIST FROM NOTEBOOK
-#     "genre": LIST OF 3 PREDICTED GENRES FROM NOTEBOOK
-#     "lyrics": GENERATED LYRICS FROM GPT OR ELSEWHERE
+#     "artist": list of truth artists
+#     "genre" : list of predicted genres
+#     "lyrics": list of generated lyrics from LLM
 # }
 with open("prompt.yml", 'r') as f:
     metas_skel = yaml.load(f, Loader)
@@ -74,22 +72,38 @@ with open("prompt.yml", 'r') as f:
 # Check skeleton has what we expect
 keys = metas_skel.keys()
 assert type(metas_skel) == type(dict()), "Loaded prompt object not a dictionary"
-assert all(["artist" in keys, "genres" in keys, "lyrics" in keys]), "Loaded dictionary doesn't have the right keys"
-assert type(metas_skel["genre"]) == type([]), "Genres must be in a list"
-assert len(metas_skel["genre"]) > 0 and len(metas_skel["genre"]) <= 5, "Must specify 1 to 5 genres in genre list"
+assert all(["artist" in keys, "genre" in keys, "lyrics" in keys]), "Loaded dictionary doesn't have the right keys"
 
-# Depending on if we're doing 1b or 5b param model, either keep first genre
-# or combine the 3, respectively
-if model=='5b_lyrics':
-    metas_skel["genre"] = reduce(lambda x, y: x + " " + y, metas_skel["genre"])
+# Add some extra details to the prompt, and make `n_samples` copies in a list,
+# if `multi_prompt` is false. This means we will make multiple samples from the
+# same prompt
+if not multi_prompt:
+    assert all([type(metas_skel["artist"]) != type([]),
+                type(metas_skel["genre"]) != type([]),
+                type(metas_skel["lyrics"]) != type([])]), "Lists in prompt, did you mean to enable multi_pompt in config?"
+    metas_skel["total_length"] = hps.sample_length
+    metas_skel["offset"] = 0
+    metas = [metas_skel] * hps.n_samples
+
+# If we want multi_prompt, then we will build the metas list
 else:
-    metas_skel["genre"] = metas_skel["genre"][0]
+    assert all([type(metas_skel["artist"]) == type([]),
+                type(metas_skel["genre"]) == type([]),
+                type(metas_skel["lyrics"]) == type([])]), "multi_prompt was specified in config, but no lists in prompt"
+    metas = [{} for _ in range(hps.n_samples)]
+    
+    for idx in range(len(metas_skel["artist"])):
+        if idx > hps.n_samples:
+            break
 
+        metas[idx]["artist"] = metas_skel["artist"][idx]
+        metas[idx]["genre"] = metas_skel["genre"][idx]
 
-# Add some extra details to the prompt, and make `n_samples` copies in a list
-metas_skel["total_length"] = hps.sample_length
-metas_skel["offset"] = 0
-metas = [metas_skel] * hps.n_samples
+        # Seems to be a bug that doesn't like an empty string for lyrics, so I
+        # replace any empty string with a dummy char
+        metas[idx]["lyrics"] = metas_skel["lyrics"][idx] if metas_skel["lyrics"][idx] != "" else "a"
+        metas[idx]["total_length"] = hps.sample_length
+        metas[idx]["offset"] = 0
 
 # Generate batch of labels
 labels = [None, None, top_prior.labeller.get_batch_labels(metas, 'cuda')]
@@ -117,11 +131,9 @@ sampling_kwargs = [dict(temp=.99, fp16=True, max_batch_size=lower_batch_size,
 # This will take about 10 minutes per 30 seconds of requested length
 print(80*'*')
 print("Generating Layer 2...")
-start = time()
 zs = [t.zeros(hps.n_samples,0,dtype=t.long, device='cuda') for _ in range(len(priors))]
 zs = _sample(zs, labels, sampling_kwargs, [None, None, top_prior], [2], hps)
-end = time()
-print(f"Layer 2 complete! Took {start - end} seconds")
+print("Layer 2 complete!")
 
 ###############################################################################
 # Upsample Stage for second and final layers
@@ -144,7 +156,5 @@ print("Upsamplers loaded!")
 # Upsample the base layer into better sounding music
 print(80*'*')
 print("Generating Layers 1 and 0...")
-start = time()
 zs = upsample(zs, labels, sampling_kwargs, [*upsamplers, top_prior], hps)
-end = time()
-print(f"Layers 1 and 0 complete! Took {start - end} seconds")
+print("Layers 1 and 0 complete!")
